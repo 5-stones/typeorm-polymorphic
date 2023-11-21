@@ -1,0 +1,3 @@
+export declare const POLYMORPHIC_OPTIONS = "POLYMORPHIC_OPTIONS";
+export declare const POLYMORPHIC_KEY_SEPARATOR = "::";
+export declare const POLYMORPHIC_REPOSITORY = "POLYMORPHIC_REPOSITORY";
