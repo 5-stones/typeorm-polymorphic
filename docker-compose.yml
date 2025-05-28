@@ -1,10 +1,8 @@
-version: "3"
-
 services:
   db:
     image: mysql:5.7
     env_file: .env
-    ports: 
+    ports:
       - 3306:3306
     volumes:
       - db_data:/var/lib/mysql
