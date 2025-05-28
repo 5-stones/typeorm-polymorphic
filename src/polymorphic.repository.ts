@@ -1,10 +1,12 @@
 import 'reflect-metadata';
 import {
+  Brackets,
   DataSource,
   DeepPartial,
   FindManyOptions,
   FindOneOptions,
   getMetadataArgsStorage,
+  In,
   ObjectLiteral,
   Repository,
   SaveOptions,
@@ -21,12 +23,6 @@ import {
 import { EntityRepositoryMetadataArgs } from 'typeorm/metadata-args/EntityRepositoryMetadataArgs';
 import { RepositoryNotFoundException } from './repository.token.exception';
 import { POLYMORPHIC_REPOSITORY } from './constants';
-
-type PolymorphicHydrationType = {
-  key: string;
-  type: 'children' | 'parent';
-  values: PolymorphicChildInterface[] | PolymorphicChildInterface;
-};
 
 const entityTypeColumn = (options: PolymorphicMetadataInterface): string =>
   options.entityTypeColumn || 'entityType';
@@ -105,98 +101,186 @@ export abstract class AbstractPolymorphicRepository<
   }
 
   public async hydrateMany(entities: E[]): Promise<E[]> {
-    return Promise.all(entities.map((ent) => this.hydrateOne(ent)));
+    return this.hydratePolymorphs(entities);
   }
 
   public async hydrateOne(entity: E): Promise<E> {
+    return (await this.hydratePolymorphs([entity]))[0];
+  }
+
+  private async hydratePolymorphs(entities: E[]) {
+    if (!this.isPolymorph()) {
+      return entities;
+    }
+
     const metadata = this.getPolymorphicMetadata();
+    const groupedMetadata = metadata.reduce<
+      Record<
+        string,
+        {
+          entityType: Function;
+          metadata: PolymorphicMetadataInterface[];
+        }
+      >
+    >((acc, meta) => {
+      const entityTypes = this.getEntityTypes(meta);
+      for (const entityType of entityTypes) {
+        acc[entityType.name] = acc[entityType.name] || {
+          entityType,
+          metadata: [],
+        };
 
-    return this.hydratePolymorphs(entity, metadata);
+        acc[entityType.name].metadata.push(meta);
+      }
+      return acc;
+    }, {});
+
+    const groupedMetadataKeys = Object.keys(groupedMetadata);
+    for (const key of groupedMetadataKeys) {
+      // hydrate each entityType in batch based on the associated metadata/properties
+      const { entityType, metadata } = groupedMetadata[key];
+      await this.findAndHydrateEntityTypeForPolymorphicOptions({
+        entities,
+        entityType,
+        metadata,
+      });
+    }
+
+    return entities;
   }
 
-  private async hydratePolymorphs(
-    entity: E,
-    options: PolymorphicMetadataInterface[],
-  ): Promise<E> {
-    const values = await Promise.all(
-      options.map((option: PolymorphicMetadataInterface) =>
-        this.hydrateEntities(entity, option),
-      ),
-    );
-
-    return values.reduce<E>((e: E, vals: PolymorphicHydrationType) => {
-      const values =
-        vals.type === 'parent' && Array.isArray(vals.values)
-          ? vals.values.filter((v) => typeof v !== 'undefined')
-          : vals.values;
-      const polys =
-        vals.type === 'parent' && Array.isArray(values) ? values[0] : values; // TODO should be condition for !hasMany
-      type EntityKey = keyof E;
-      const key = vals.key as EntityKey;
-      e[key] = polys as (typeof e)[typeof key];
-
-      return e;
-    }, entity);
-  }
-
-  private async hydrateEntities(
-    entity: E,
-    options: PolymorphicMetadataInterface,
-  ): Promise<PolymorphicHydrationType> {
-    const entityTypes: (Function | string)[] =
-      options.type === 'parent'
-        ? [entity[entityTypeColumn(options)]]
-        : Array.isArray(options.classType)
-        ? options.classType
-        : [options.classType];
-
-    // TODO if not hasMany, should I return if one is found?
-    const results = await Promise.all(
-      entityTypes.map((type: Function) =>
-        type ? this.findPolymorphs(entity, type, options) : null,
-      ),
-    );
-
-    return {
-      key: options.propertyKey,
-      type: options.type,
-      values: (options.hasMany &&
-      Array.isArray(results) &&
-      results.length > 0 &&
-      Array.isArray(results[0])
-        ? results.reduce<PolymorphicChildInterface[]>(
-            (
-              resultEntities: PolymorphicChildInterface[],
-              entities: PolymorphicChildInterface[],
-            ) => entities.concat(...resultEntities),
-            [] as PolymorphicChildInterface[],
-          )
-        : results) as PolymorphicChildInterface | PolymorphicChildInterface[],
-    };
-  }
-
-  private async findPolymorphs(
-    parent: E,
-    entityType: Function,
-    options: PolymorphicMetadataInterface,
-  ): Promise<PolymorphicChildInterface[] | PolymorphicChildInterface | never> {
+  private async findAndHydrateEntityTypeForPolymorphicOptions({
+    entities,
+    entityType,
+    metadata,
+  }: {
+    entities: E[];
+    entityType: Function;
+    metadata: PolymorphicMetadataInterface[];
+  }) {
+    /**
+     * Fetch the polymorphs for the given entityType, it's corresponding
+     * metadata options, and the set of entities we're hydrating.
+     */
     const repository = this.findRepository(entityType);
+    const query = repository.createQueryBuilder('p');
 
-    return repository[options.hasMany ? 'find' : 'findOne'](
-      options.type === 'parent'
-        ? {
-            where: {
-              // TODO: Not sure about this change (key was just id before)
-              [PrimaryColumn(options)]: parent[entityIdColumn(options)],
-            },
+    for (const options of metadata) {
+      if (this.isParent(options)) {
+        const parentIds = entities
+          .filter((entity) => {
+            return entity[entityTypeColumn(options)] === entityType.name;
+          })
+          .reduce((set, entity) => {
+            set.add(entity[entityIdColumn(options)]);
+            return set;
+          }, new Set<number>());
+        query.orWhere({
+          [PrimaryColumn(options)]: In([...parentIds]),
+        });
+      } else {
+        const entityIds = entities.reduce((set, entity) => {
+          set.add(entity[this.getRepositoryEntityPrimaryColumn()]);
+          return set;
+        }, new Set<number>());
+        query.orWhere(
+          new Brackets((qb) => {
+            const idColumn = entityIdColumn(options);
+            const typeColumn = entityTypeColumn(options);
+            qb.where(`p.${idColumn} IN (:...ids)`, {
+              ids: [...entityIds],
+            }).andWhere(`p.${typeColumn} = :entityType`, {
+              entityType: entities[0].constructor.name,
+            });
+          }),
+        );
+      }
+    }
+
+    /**
+     * Map the fetched polymorphs into their appropriate entities for each
+     * metadata option.
+     */
+    const polymorphsIdColumn =
+      this.getRepositoryEntityPrimaryColumn(repository);
+    const polymorphs = await query.getMany();
+    const polymorphsIdColumnMap = polymorphs.reduce((acc, poly) => {
+      acc[poly[polymorphsIdColumn].toString()] = poly;
+      return acc;
+    }, {});
+
+    for (const options of metadata) {
+      const key = options.propertyKey as keyof E;
+
+      if (this.isParent(options)) {
+        const idColumn = entityIdColumn(options);
+        const entitiesToHydrate = entities.reduce((acc, entity) => {
+          const isMatch = entity[entityTypeColumn(options)] === entityType.name;
+          if (isMatch) {
+            acc.push(entity);
+          } else if (entity[key] === undefined) {
+            entity[key] = null;
           }
-        : {
-            where: {
-              [entityIdColumn(options)]: parent[PrimaryColumn(options)],
-              [entityTypeColumn(options)]: parent.constructor.name,
-            },
-          },
-    );
+          return acc;
+        }, []);
+
+        entitiesToHydrate.forEach((entity) => {
+          const poly = polymorphsIdColumnMap[entity[idColumn].toString()];
+
+          if (!poly) return;
+          if (options.hasMany) {
+            entity[key] = entity[key] || ([] as E[keyof E]);
+            entity[key].push(poly);
+          } else {
+            entity[key] = poly;
+          }
+        });
+      } else {
+        const idColumn = entityIdColumn(options);
+        const polymorphsEntityIdMap = polymorphs.reduce<
+          Record<string, PolymorphicChildInterface[]>
+        >((acc, poly) => {
+          const resolvedValue = poly[idColumn];
+          if (resolvedValue !== null || resolvedValue === undefined) {
+            const resolvedValueKey = resolvedValue.toString();
+            acc[resolvedValueKey] = acc[resolvedValueKey] || [];
+            acc[resolvedValueKey].push(poly);
+          }
+          return acc;
+        }, {});
+        entities.forEach((entity) => {
+          const entityId =
+            entity[this.getRepositoryEntityPrimaryColumn()].toString();
+          const polymorphs = polymorphsEntityIdMap[entityId];
+
+          if (!polymorphs || !polymorphs.length) return;
+          if (options.hasMany) {
+            entity[key] = polymorphs as E[keyof E];
+          } else {
+            entity[key] = polymorphs[0] as E[keyof E];
+          }
+        });
+      }
+    }
+  }
+
+  private getEntityTypes(options: PolymorphicMetadataInterface): Function[] {
+    const entityTypes = new Set<Function>();
+    if (Array.isArray(options.classType)) {
+      options.classType.forEach((classType) => {
+        entityTypes.add(classType);
+      });
+    } else {
+      entityTypes.add(options.classType);
+    }
+
+    return [...entityTypes];
+  }
+
+  private getRepositoryEntityPrimaryColumn(repository: Repository<any> = this) {
+    const primaryColumnProperty =
+      repository.metadata.primaryColumns[0].propertyName;
+    return primaryColumnProperty;
   }
 
   private findRepository(
@@ -336,11 +420,7 @@ export abstract class AbstractPolymorphicRepository<
       return results;
     }
 
-    const metadata = this.getPolymorphicMetadata();
-
-    return Promise.all(
-      results.map((entity) => this.hydratePolymorphs(entity, metadata)),
-    );
+    return this.hydratePolymorphs(results);
   }
 
   public async findOne(options?: FindOneOptions<E>): Promise<E | null> {
@@ -356,7 +436,7 @@ export abstract class AbstractPolymorphicRepository<
       return entity;
     }
 
-    return this.hydratePolymorphs(entity, polymorphicMetadata);
+    return (await this.hydratePolymorphs([entity]))[0];
   }
 
   create(): E;

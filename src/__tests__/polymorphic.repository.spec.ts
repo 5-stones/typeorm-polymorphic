@@ -1,4 +1,4 @@
-import { DataSource, Repository } from 'typeorm';
+import { DataSource, DeepPartial } from 'typeorm';
 import { AdvertEntity } from './entities/advert.entity';
 import { UserEntity } from './entities/user.entity';
 import { config } from 'dotenv';
@@ -321,6 +321,126 @@ describe('AbstractPolymorphicRepository', () => {
         expect(result?.createdAdverts[0].id).toBe(advert.id);
         expect(result?.createdAdverts[0].creatorType).toBe(UserEntity.name);
         expect(result?.createdAdverts[0].creatorId).toBe(user.id);
+      });
+    });
+  });
+
+  describe('Batch', () => {
+    describe('hydrate', () => {
+      it('Can hydrate entities with polymorphic relationships properly', async () => {
+        const advertRepository = AbstractPolymorphicRepository.createRepository(
+          connection,
+          AdvertRepository,
+        );
+        const userRepository = AbstractPolymorphicRepository.createRepository(
+          connection,
+          UserRepository,
+        );
+        const merchantRepository = connection.getRepository(MerchantEntity);
+
+        const user = await userRepository.save(new UserEntity());
+        const user2 = await userRepository.save(new UserEntity());
+        const user3 = await userRepository.save(new UserEntity());
+        const merchant = await merchantRepository.save(new MerchantEntity());
+        const merchant2 = await merchantRepository.save(new MerchantEntity());
+
+        type ManifestItem = {
+          config: DeepPartial<AdvertEntity>;
+          advert: AdvertEntity | null;
+          user: UserEntity | null;
+        };
+        const manifest: Array<ManifestItem> = [
+          { config: { owner: user }, advert: null, user: user },
+          { config: { owner: user2 }, advert: null, user: user2 },
+          { config: { owner: user3 }, advert: null, user: user3 },
+          { config: { owner: merchant }, advert: null, user: null },
+          { config: { owner: merchant2 }, advert: null, user: null },
+          { config: { creator: merchant2 }, advert: null, user: null },
+          {
+            config: { owner: user, creator: merchant2 },
+            advert: null,
+            user: user,
+          },
+          {
+            config: { owner: user2, creator: merchant2 },
+            advert: null,
+            user: user2,
+          },
+        ];
+
+        // save all the items first the maximize the chance of
+        // hydration errors
+        for (const item of manifest) {
+          const entity = await advertRepository.save(
+            advertRepository.create(item.config),
+          );
+          item.advert = entity;
+        }
+
+        /********************************
+         * test advert hydration (parent)
+         ********************************/
+        const adverts = await advertRepository.find();
+        const advertManifestMap = manifest.reduce((acc, item) => {
+          if (item.advert) {
+            acc[item.advert.id] = item;
+          }
+          return acc;
+        }, {});
+
+        for (const advert of adverts) {
+          const manifestItem = advertManifestMap[advert.id];
+          if (!manifestItem) {
+            throw new Error('this should not happen.');
+          }
+
+          const {
+            config: { owner, creator },
+          } = manifestItem;
+          if (owner) {
+            expect(advert.owner).toBeInstanceOf(owner.constructor);
+            expect(advert.owner.id).toBe(owner.id);
+          }
+
+          if (creator) {
+            expect(advert.creator).toBeInstanceOf(creator.constructor);
+            expect(advert.creator.id).toBe(creator.id);
+          }
+        }
+
+        /********************************
+         * test user hydration (child)
+         ********************************/
+        const users = await userRepository.find();
+        const usersAdvertMap = manifest.reduce<Record<number, AdvertEntity[]>>(
+          (acc, item) => {
+            if (item.user && item.advert) {
+              acc[item.user.id] = acc[item.user.id] || [];
+              acc[item.user.id].push(item.advert);
+            }
+            return acc;
+          },
+          {},
+        );
+
+        for (const user of users) {
+          const adverts = usersAdvertMap[user.id];
+          if (!adverts || !adverts.length) {
+            throw new Error('this should not happen.');
+          }
+
+          const actualIds = user.adverts
+            .map((advert) => {
+              return advert.id;
+            })
+            .sort();
+          const expectedIds = adverts
+            .map((advert) => {
+              return advert.id;
+            })
+            .sort();
+          expect(actualIds).toEqual(expectedIds);
+        }
       });
     });
   });
